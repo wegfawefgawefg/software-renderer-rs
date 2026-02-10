@@ -3,6 +3,7 @@ use image::{DynamicImage, GenericImageView};
 use raylib::prelude::*;
 
 use crate::model::{load_cube, load_from_obj, TriIndices};
+use crate::bvh;
 
 pub const FRAMES_PER_SECOND: u32 = 60;
 
@@ -27,6 +28,9 @@ pub struct State {
 
     pub cube: crate::model::Model,
     pub hill: crate::model::Model,
+    pub hill_bvh: bvh::Bvh,
+    pub hill_world_pos: Vec3,
+    pub grass: crate::model::Model,
     pub water: crate::model::Model,
     pub water_base_verts: crate::model::Vertices,
     pub palm: crate::model::Model,
@@ -41,6 +45,11 @@ impl State {
         });
 
         let z_len = (render_dims.x as usize) * (render_dims.y as usize);
+        let hill = crate::model::gen_sandy_hill(10, 16, 6.0, 0.5);
+        let hill_world_pos = Vec3::new(0.0, -1.6, -10.0);
+        let hill_bvh = build_model_bvh(&hill, hill_world_pos, Vec3::splat(1.0));
+        let grass = gen_grass_on_hill(&hill_bvh, 0xC0FFEEu32);
+
         let water = crate::model::gen_water_plane(24, 24, 30.0, 30.0, -0.9);
         let water_base_verts = water.verts.clone();
         Self {
@@ -56,12 +65,133 @@ impl State {
             render_dims,
             z_buffer: vec![f32::MAX; z_len],
             cube: load_cube(),
-            hill: crate::model::gen_sandy_hill(10, 16, 6.0, 0.5),
+            hill,
+            hill_bvh,
+            hill_world_pos,
+            grass,
             water,
             water_base_verts,
             palm: crate::model::gen_palm_tree(),
             tree: load_from_obj("./treepot.obj"),
         }
+    }
+}
+
+fn build_model_bvh(model: &crate::model::Model, world_pos: Vec3, world_scale: Vec3) -> bvh::Bvh {
+    let mut tris = Vec::with_capacity(model.tri_indices.len());
+    for t in &model.tri_indices {
+        let a = model.verts[t[0]] * world_scale + world_pos;
+        let b = model.verts[t[1]] * world_scale + world_pos;
+        let c = model.verts[t[2]] * world_scale + world_pos;
+        tris.push(bvh::Triangle { a, b, c });
+    }
+    bvh::Bvh::build(tris)
+}
+
+fn gen_grass_on_hill(hill_bvh: &bvh::Bvh, seed0: u32) -> crate::model::Model {
+    // Thin tall grass blades as double-sided triangles, placed in small patches via raycasts.
+    let mut seed = seed0;
+    let hash_u32 = |x: u32| -> u32 {
+        let mut v = x.wrapping_mul(0x9E3779B9);
+        v ^= v >> 16;
+        v = v.wrapping_mul(0x85EBCA6B);
+        v ^= v >> 13;
+        v = v.wrapping_mul(0xC2B2AE35);
+        v ^= v >> 16;
+        v
+    };
+    let mut rand01 = || -> f32 {
+        seed = hash_u32(seed);
+        ((seed >> 8) as f32) / ((u32::MAX >> 8) as f32)
+    };
+
+    let mut verts: crate::model::Vertices = Vec::new();
+    let mut tri_indices: crate::model::TriIndices = Vec::new();
+    let mut tri_colors: crate::model::TriColors = Vec::new();
+
+    let patch_count = 8;
+    let mut placed_patches = 0;
+    let mut attempts = 0;
+
+    while placed_patches < patch_count && attempts < patch_count * 20 {
+        attempts += 1;
+
+        // Random point in a disk around the island center-ish.
+        let r = 3.1 * rand01().sqrt();
+        let a = std::f32::consts::TAU * rand01();
+        let x = r * a.cos();
+        let z = -10.0 + r * a.sin(); // hill is centered around z ~ -10
+
+        let ray = bvh::Ray {
+            origin: Vec3::new(x, 50.0, z),
+            dir: Vec3::new(0.0, -1.0, 0.0),
+        };
+        let Some(hit) = hill_bvh.raycast(&ray, 0.0, 200.0) else {
+            continue;
+        };
+
+        // Slightly above the sand to avoid z-fighting.
+        let patch_center = hit.pos + Vec3::new(0.0, 0.03, 0.0);
+
+        let blades_in_patch = 1 + (rand01() * 8.0) as usize; // [1..8]
+        let patch_radius = 0.45;
+        for _ in 0..blades_in_patch {
+            // Offset within patch.
+            let rr = patch_radius * rand01().sqrt();
+            let aa = std::f32::consts::TAU * rand01();
+            let bx = patch_center.x + rr * aa.cos();
+            let bz = patch_center.z + rr * aa.sin();
+
+            // Raycast down again for local curvature.
+            let ray = bvh::Ray {
+                origin: Vec3::new(bx, 50.0, bz),
+                dir: Vec3::new(0.0, -1.0, 0.0),
+            };
+            let Some(hit) = hill_bvh.raycast(&ray, 0.0, 200.0) else {
+                continue;
+            };
+            let base = hit.pos + Vec3::new(0.0, 0.03, 0.0);
+
+            let yaw = std::f32::consts::TAU * rand01();
+            let dir = Vec3::new(yaw.cos(), 0.0, yaw.sin());
+            let right = Vec3::new(-dir.z, 0.0, dir.x);
+
+            let height = 0.35 + rand01() * 0.45;
+            let width = 0.03 + rand01() * 0.03;
+            let lean = (rand01() - 0.5) * 0.35;
+            let tip = base + Vec3::new(0.0, height, 0.0) + dir * (height * lean);
+
+            let v0 = base - right * width;
+            let v1 = base + right * width;
+            let v2 = tip;
+
+            let i0 = verts.len();
+            verts.push(v0);
+            verts.push(v1);
+            verts.push(v2);
+
+            // Double-sided.
+            tri_indices.push([i0, i0 + 1, i0 + 2]);
+            tri_indices.push([i0, i0 + 2, i0 + 1]);
+
+            // Slight shade variation per blade.
+            let shade = (rand01() - 0.5) * 0.25;
+            let mut c = [55u8, 175u8, 70u8, 255u8];
+            for ch in 0..3 {
+                c[ch] = ((c[ch] as f32) * (1.0 + shade)).clamp(0.0, 255.0) as u8;
+            }
+            tri_colors.push(c);
+            tri_colors.push(c);
+        }
+
+        placed_patches += 1;
+    }
+
+    crate::model::Model {
+        verts,
+        tri_indices,
+        tri_tex_coords: Vec::new(),
+        tri_colors,
     }
 }
 
@@ -490,6 +620,7 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
     let hill = &state.hill;
     let water = &mut state.water;
     let palm = &state.palm;
+    let grass = &state.grass;
     let tree = &state.tree;
 
     // needed for transforming verts
@@ -521,7 +652,7 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
 
     // Draw hill first (opaque).
     {
-        let hill_pos = Vec3::new(0.0, -1.6, -10.0);
+        let hill_pos = state.hill_world_pos;
         let hill_scale = Vec3::splat(1.0);
         let mvp = build_mvp(hill_pos, 0.0, hill_scale, &state.cam, aspect_ratio);
 
@@ -554,6 +685,114 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
             }
 
             let [r, g, b, a] = hill.tri_colors[i];
+            let face_color = Color::new(r, g, b, a);
+
+            let base = poly[0];
+            for k in 1..(poly.len() - 1) {
+                let a = base;
+                let b = poly[k];
+                let c = poly[k + 1];
+
+                if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
+                    continue;
+                }
+
+                let invwa = 1.0 / a.clip.w;
+                let invwb = 1.0 / b.clip.w;
+                let invwc = 1.0 / c.clip.w;
+                let ndc_a = Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
+                let ndc_b = Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
+                let ndc_c = Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
+
+                let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
+                    - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
+                if !DOUBLE_SIDED {
+                    if FRONT_FACE_CCW {
+                        if area_ndc <= 0.0 {
+                            continue;
+                        }
+                    } else if area_ndc >= 0.0 {
+                        continue;
+                    }
+                }
+
+                let sc_a = ndc_to_sc(&ndc_a, render_resolution);
+                let sc_b = ndc_to_sc(&ndc_b, render_resolution);
+                let sc_c = ndc_to_sc(&ndc_c, render_resolution);
+
+                let sa = ScreenVert {
+                    x: sc_a.x,
+                    y: sc_a.y,
+                    z: ndc_a.z,
+                    inv_w: invwa,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+                let sb = ScreenVert {
+                    x: sc_b.x,
+                    y: sc_b.y,
+                    z: ndc_b.z,
+                    inv_w: invwb,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+                let sc = ScreenVert {
+                    x: sc_c.x,
+                    y: sc_c.y,
+                    z: ndc_c.z,
+                    inv_w: invwc,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+
+                draw_solid_tri(
+                    &mut d,
+                    face_color,
+                    sa,
+                    sb,
+                    sc,
+                    &mut state.z_buffer,
+                    state.render_dims.x as usize,
+                    viewport_w,
+                    viewport_h,
+                );
+            }
+        }
+    }
+
+    // Draw grass patches (solid-color), on top of the hill.
+    {
+        let mvp = build_mvp(Vec3::ZERO, 0.0, Vec3::splat(1.0), &state.cam, aspect_ratio);
+
+        let mut clip_verts = Vec::with_capacity(grass.verts.len());
+        for v in &grass.verts {
+            clip_verts.push(mvp * v.extend(1.0));
+        }
+
+        for i in 0..grass.tri_indices.len() {
+            let i0 = grass.tri_indices[i][0] as usize;
+            let i1 = grass.tri_indices[i][1] as usize;
+            let i2 = grass.tri_indices[i][2] as usize;
+
+            let v0 = ClipVert {
+                clip: clip_verts[i0],
+                uv: Vec2::ZERO,
+            };
+            let v1 = ClipVert {
+                clip: clip_verts[i1],
+                uv: Vec2::ZERO,
+            };
+            let v2 = ClipVert {
+                clip: clip_verts[i2],
+                uv: Vec2::ZERO,
+            };
+
+            let poly = clip_triangle(v0, v1, v2);
+            if poly.len() < 3 {
+                continue;
+            }
+
+            let [r, g, b, a] = grass.tri_colors[i];
             let face_color = Color::new(r, g, b, a);
 
             let base = poly[0];
@@ -741,7 +980,18 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
 
     // Draw palm (solid-color) sitting on the hill.
     {
-        let palm_pos = Vec3::new(1.5, -1.6 + 1.35, -10.0); // roughly on hill surface
+        // Place palm by raycasting straight down onto the hill BVH.
+        let palm_xz = Vec2::new(1.5, -10.0);
+        let ray = bvh::Ray {
+            origin: Vec3::new(palm_xz.x, 50.0, palm_xz.y),
+            dir: Vec3::new(0.0, -1.0, 0.0),
+        };
+        let hit = state.hill_bvh.raycast(&ray, 0.0, 200.0);
+        let palm_pos = if let Some(h) = hit {
+            h.pos + Vec3::new(0.0, -0.20, 0.0)
+        } else {
+            Vec3::new(palm_xz.x, -0.25, palm_xz.y)
+        };
         let palm_scale = Vec3::splat(1.0);
         let mvp = build_mvp(palm_pos, 0.0, palm_scale, &state.cam, aspect_ratio);
 

@@ -3,6 +3,7 @@ use raylib::prelude::*;
 use raylib::{ffi::SetTraceLogLevel, prelude::TraceLogLevel};
 
 mod cube;
+mod bvh;
 mod model;
 mod sketch;
 

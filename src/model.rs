@@ -276,65 +276,130 @@ pub fn gen_palm_tree() -> Model {
 
     // Fronds (ribbon strips).
     {
+        // "Cutesy" low-poly palm leaves: chunky rectangles/trapezoids + a triangle tip.
         let frond_count = 8;
-        let frond_len = 3.2;
-        let frond_w = 0.35;
-        let segs = 8usize;
-        let leaf_color = [40u8, 150u8, 70u8, 255u8];
+        let leaf_color = [60u8, 190u8, 70u8, 255u8];
+
+        let hash_u32 = |x: u32| -> u32 {
+            // Cheap deterministic hash.
+            let mut v = x.wrapping_mul(0x9E3779B9);
+            v ^= v >> 16;
+            v = v.wrapping_mul(0x85EBCA6B);
+            v ^= v >> 13;
+            v = v.wrapping_mul(0xC2B2AE35);
+            v ^= v >> 16;
+            v
+        };
+        let rand01 = |seed: &mut u32| -> f32 {
+            *seed = hash_u32(*seed);
+            // 24-bit mantissa-ish.
+            ((*seed >> 8) as f32) / ((u32::MAX >> 8) as f32)
+        };
 
         for fi in 0..frond_count {
-            let yaw = (fi as f32 / frond_count as f32) * std::f32::consts::TAU;
-            let pitch = -0.55; // droop
+            let mut seed = hash_u32(fi as u32 + 1337);
+            let yaw_base = (fi as f32 / frond_count as f32) * std::f32::consts::TAU;
+            let yaw_jitter = (rand01(&mut seed) - 0.5) * 0.35;
+            let yaw = yaw_base + yaw_jitter;
+
+            // Leaves should go up/out first, then kink down. Keep angles moderate:
+            // using tan() here can explode quickly, so keep this in a sane range.
+            let pitch_up = 0.18 + rand01(&mut seed) * 0.22;
+            let pitch_down = -0.55 - rand01(&mut seed) * 0.35;
+            let roll = (rand01(&mut seed) - 0.5) * 0.35;
+
+            // Segment lengths.
+            let l0 = 0.50 + rand01(&mut seed) * 0.25; // near crown
+            let l1 = 0.55 + rand01(&mut seed) * 0.35; // mid
+            let l2 = 0.40 + rand01(&mut seed) * 0.40; // far
+            let tip = 0.25 + rand01(&mut seed) * 0.25;
+
+            let w0 = 0.40 + rand01(&mut seed) * 0.20;
+            let w1 = w0 * (0.85 + rand01(&mut seed) * 0.15);
+            let w2 = w1 * (0.7 + rand01(&mut seed) * 0.15);
+
+            // Local centerline points (in X/Y; width along Z).
+            let p0 = Vec3::new(0.0, 0.0, 0.0);
+            // Use a scaled angle (radians) instead of tan() to avoid huge vertical spikes.
+            let p1 = Vec3::new(l0, l0 * pitch_up * 0.55, 0.0);
+            let p2 = p1 + Vec3::new(l1, l1 * pitch_up * 0.35, 0.0);
+            let p3 = p2 + Vec3::new(l2, l2 * pitch_down * 0.55, 0.0);
+            let pt = p3 + Vec3::new(tip, tip * pitch_down * 0.70, 0.0);
+
+            // Crown placement around trunk top.
+            let crown_r = 0.18 + rand01(&mut seed) * 0.22;
+            let crown_y = 4.9 + rand01(&mut seed) * 0.25;
+            let crown = Vec3::new(0.8, crown_y, 0.0)
+                + Vec3::new(yaw.cos(), 0.0, yaw.sin()) * crown_r;
+
             let rot =
-                glam::Quat::from_rotation_y(yaw) * glam::Quat::from_rotation_z(pitch);
+                glam::Quat::from_rotation_y(yaw) * glam::Quat::from_rotation_x(roll);
 
-            let base = Vec3::new(0.8, 5.0, 0.0); // roughly matches trunk top/bend
+            let mut f_verts: Vertices = Vec::with_capacity(10);
+            let mut f_tris: TriIndices = Vec::with_capacity(16);
 
-            let mut f_verts: Vertices = Vec::with_capacity((segs + 1) * 2);
-            let mut f_tris: TriIndices = Vec::with_capacity(segs * 2);
+            // Helper: add a trapezoid segment between pa->pb with widths wa->wb (half-width).
+            let mut add_seg = |pa: Vec3, pb: Vec3, wa: f32, wb: f32, f_verts: &mut Vertices, f_tris: &mut TriIndices| {
+                let base = f_verts.len();
+                f_verts.push(pa + Vec3::new(0.0, 0.0, -wa));
+                f_verts.push(pa + Vec3::new(0.0, 0.0, wa));
+                f_verts.push(pb + Vec3::new(0.0, 0.0, -wb));
+                f_verts.push(pb + Vec3::new(0.0, 0.0, wb));
 
-            for si in 0..=segs {
-                let t = si as f32 / segs as f32;
-                let x = t * frond_len;
-                let y = -0.25 * (t * t) * frond_len; // curve down
-                let center = Vec3::new(x, y, 0.0);
-                let w = frond_w * (1.0 - 0.6 * t);
-                let left = center + Vec3::new(0.0, 0.0, -w);
-                let right = center + Vec3::new(0.0, 0.0, w);
-                f_verts.push(base + rot * left);
-                f_verts.push(base + rot * right);
-            }
+                let i00 = base + 0;
+                let i01 = base + 1;
+                let i10 = base + 2;
+                let i11 = base + 3;
 
-            let idx = |si: usize, lr: usize| si * 2 + lr;
-            for si in 0..segs {
-                let i00 = idx(si, 0);
-                let i01 = idx(si, 1);
-                let i10 = idx(si + 1, 0);
-                let i11 = idx(si + 1, 1);
-
-                // Double-sided leaves: emit both windings so backface culling won't hide them.
                 let t0 = [i00, i10, i11];
                 let t1 = [i00, i11, i01];
                 f_tris.push(t0);
                 f_tris.push(t1);
+                // double-sided
                 f_tris.push([t0[0], t0[2], t0[1]]);
                 f_tris.push([t1[0], t1[2], t1[1]]);
+            };
+
+            add_seg(p0, p1, w0, w0 * 0.95, &mut f_verts, &mut f_tris);
+            add_seg(p1, p2, w0 * 0.95, w1, &mut f_verts, &mut f_tris);
+            add_seg(p2, p3, w1, w2, &mut f_verts, &mut f_tris);
+
+            // Tip triangle off the last segment end.
+            {
+                let base = f_verts.len();
+                f_verts.push(p3 + Vec3::new(0.0, 0.0, -w2));
+                f_verts.push(p3 + Vec3::new(0.0, 0.0, w2));
+                f_verts.push(pt);
+                let t0 = [base + 0, base + 2, base + 1];
+                f_tris.push(t0);
+                f_tris.push([t0[0], t0[2], t0[1]]); // double-sided
             }
 
+            // Apply world placement/rotation.
+            for v in &mut f_verts {
+                *v = crown + (rot * *v);
+            }
+
+            // Slight per-frond shade variation.
+            let shade = (rand01(&mut seed) - 0.5) * 0.18; // [-0.09..+0.09]
+            let mut c = leaf_color;
+            for ch in 0..3 {
+                c[ch] = ((c[ch] as f32) * (1.0 + shade)).clamp(0.0, 255.0) as u8;
+            }
             append_mesh(
                 &mut verts,
                 &mut tri_indices,
                 &mut tri_colors,
                 &f_verts,
                 &f_tris,
-                leaf_color,
+                c,
             );
         }
     }
 
     // Coconuts.
     {
-        let coco_color = [120u8, 90u8, 55u8, 255u8];
+        let coco_color = [70u8, 50u8, 30u8, 255u8];
         let (s_verts, s_tris) = gen_lowpoly_sphere(6, 10, 0.22);
         let centers = [
             Vec3::new(0.75, 4.8, 0.15),
