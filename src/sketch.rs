@@ -6,6 +6,9 @@ use crate::model::{load_cube, load_from_obj, TriIndices};
 
 pub const FRAMES_PER_SECOND: u32 = 60;
 
+const DOUBLE_SIDED: bool = false;
+const FRONT_FACE_CCW: bool = true;
+
 pub struct Cam {
     pub pos: Vec3,
     pub dir: Vec3,
@@ -20,6 +23,7 @@ pub struct State {
 
     pub render_dims: glam::UVec2,
     pub z_buffer: Vec<f32>,
+    pub grid_dims: i32,
 
     pub cube: crate::model::Model,
     pub tree: crate::model::Model,
@@ -44,6 +48,7 @@ impl State {
             texture,
             render_dims,
             z_buffer: vec![f32::MAX; z_len],
+            grid_dims: 16,
             cube: load_cube(),
             tree: load_from_obj("./treepot.obj"),
         }
@@ -156,6 +161,96 @@ fn edge_fn(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
     (px - ax) * (by - ay) - (py - ay) * (bx - ax)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ClipVert {
+    pub clip: Vec4,
+    pub uv: Vec2,
+}
+
+fn clip_poly_against_plane<F>(poly: &[ClipVert], dist_fn: F) -> Vec<ClipVert>
+where
+    F: Fn(Vec4) -> f32,
+{
+    if poly.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(poly.len() + 2);
+
+    let mut prev = *poly.last().unwrap();
+    let mut prev_d = dist_fn(prev.clip);
+    let mut prev_in = prev_d >= 0.0;
+
+    for &cur in poly {
+        let cur_d = dist_fn(cur.clip);
+        let cur_in = cur_d >= 0.0;
+
+        if prev_in && cur_in {
+            out.push(cur);
+        } else if prev_in && !cur_in {
+            let denom = prev_d - cur_d;
+            if denom != 0.0 {
+                let t = prev_d / denom;
+                let clip = prev.clip + (cur.clip - prev.clip) * t;
+                let uv = prev.uv + (cur.uv - prev.uv) * t;
+                out.push(ClipVert { clip, uv });
+            }
+        } else if !prev_in && cur_in {
+            let denom = prev_d - cur_d;
+            if denom != 0.0 {
+                let t = prev_d / denom;
+                let clip = prev.clip + (cur.clip - prev.clip) * t;
+                let uv = prev.uv + (cur.uv - prev.uv) * t;
+                out.push(ClipVert { clip, uv });
+            }
+            out.push(cur);
+        }
+
+        prev = cur;
+        prev_d = cur_d;
+        prev_in = cur_in;
+    }
+
+    out
+}
+
+fn clip_triangle(v0: ClipVert, v1: ClipVert, v2: ClipVert) -> Vec<ClipVert> {
+    // Clip volume (OpenGL): -w<=x<=w, -w<=y<=w, -w<=z<=w
+    let left = |c: Vec4| c.x + c.w;
+    let right = |c: Vec4| -c.x + c.w;
+    let bottom = |c: Vec4| c.y + c.w;
+    let top = |c: Vec4| -c.y + c.w;
+    let nearp = |c: Vec4| c.z + c.w;
+    let farp = |c: Vec4| -c.z + c.w;
+
+    let mut poly = vec![v0, v1, v2];
+    poly = clip_poly_against_plane(&poly, left);
+    if poly.len() < 3 {
+        return Vec::new();
+    }
+    poly = clip_poly_against_plane(&poly, right);
+    if poly.len() < 3 {
+        return Vec::new();
+    }
+    poly = clip_poly_against_plane(&poly, bottom);
+    if poly.len() < 3 {
+        return Vec::new();
+    }
+    poly = clip_poly_against_plane(&poly, top);
+    if poly.len() < 3 {
+        return Vec::new();
+    }
+    poly = clip_poly_against_plane(&poly, nearp);
+    if poly.len() < 3 {
+        return Vec::new();
+    }
+    poly = clip_poly_against_plane(&poly, farp);
+    if poly.len() < 3 {
+        return Vec::new();
+    }
+    poly
+}
+
 pub fn draw_texture_tri(
     d: &mut impl RaylibDraw,
     texture: &DynamicImage,
@@ -256,6 +351,13 @@ pub fn process_events_and_input(rl: &mut RaylibHandle, state: &mut State) {
         state.running = false;
     }
 
+    if rl.is_key_pressed(raylib::consts::KeyboardKey::KEY_EQUAL) {
+        state.grid_dims = (state.grid_dims + 1).min(256);
+    }
+    if rl.is_key_pressed(raylib::consts::KeyboardKey::KEY_MINUS) {
+        state.grid_dims = (state.grid_dims - 1).max(1);
+    }
+
     // move cam with wasd
     let speed = 0.025;
     let up = Vec3::new(0.0, 1.0, 0.0);
@@ -327,23 +429,25 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
     // Explicit alpha blending (RGBA) for textures.
     let mut d = d.begin_blend_mode(BlendMode::BLEND_ALPHA);
 
-    for z in 0..1 {
-        for x in 0..1 {
+    let grid: i32 = state.grid_dims;
+    let spacing = size * 1.25;
+    let start_x = -(grid as f32 - 1.0) * spacing * 0.5;
+    let start_z = -2.0;
+
+    for gz in 0..grid {
+        for gx in 0..grid {
             let angle = 0.0;
-            // let angle = d.get_time() as f32 + (x + z) as f32;
-            let pos = Vec3::new(x as f32 * size + x as f32, 0.0, -z as f32 * size - z as f32);
-            // let pos = Vec3::new(0.0, 0.0, -5.0);
+            let pos = Vec3::new(
+                start_x + gx as f32 * spacing,
+                0.0,
+                start_z - gz as f32 * spacing,
+            );
             let mvp = build_mvp(pos, angle, scale, &state.cam, aspect_ratio);
 
-            ////////  calc screen space vertices (keep 1/w for perspective-correct interpolation)    ////////
-            let mut transformed_verts = Vec::with_capacity(cube.verts.len());
-            let mut inv_ws = Vec::with_capacity(cube.verts.len());
+            ////////  calc clip space vertices    ////////
+            let mut clip_verts = Vec::with_capacity(cube.verts.len());
             for v in &cube.verts {
-                let clip = mvp * v.extend(1.0);
-                let inv_w = 1.0 / clip.w;
-                let ndc = Vec3::new(clip.x * inv_w, clip.y * inv_w, clip.z * inv_w);
-                transformed_verts.push(ndc_to_sc(&ndc, render_resolution));
-                inv_ws.push(inv_w);
+                clip_verts.push(mvp * v.extend(1.0));
             }
 
             for i in 0..cube.tri_indices.len() {
@@ -351,67 +455,102 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
                 let i1 = cube.tri_indices[i][1] as usize;
                 let i2 = cube.tri_indices[i][2] as usize;
 
-                let p0 = transformed_verts[i0];
-                let p1 = transformed_verts[i1];
-                let p2 = transformed_verts[i2];
-
-                // skip if tri facing wrong way
-                // let normal = normals[i];
-                // let c = (tri_verts[0] + tri_verts[1] + tri_verts[2]) / 3.0;
-                // let view_dir = (-state.cam.pos - c).normalize();
-                // if view_dir.dot(normal) <= 0.0 {
-                //     continue;
-                // }
-
-                // skip if verts are outside of view frustum range,
-                // // especially behind cam
-                if [p0, p1, p2].iter().any(|v| v.z < -1.0 || v.z > 1.0) {
-                    continue;
-                }
-
                 let uv0 = cube.tri_tex_coords[i][0];
                 let uv1 = cube.tri_tex_coords[i][1];
                 let uv2 = cube.tri_tex_coords[i][2];
 
-                let invw0 = inv_ws[i0];
-                let invw1 = inv_ws[i1];
-                let invw2 = inv_ws[i2];
+                let v0 = ClipVert {
+                    clip: clip_verts[i0],
+                    uv: uv0,
+                };
+                let v1 = ClipVert {
+                    clip: clip_verts[i1],
+                    uv: uv1,
+                };
+                let v2 = ClipVert {
+                    clip: clip_verts[i2],
+                    uv: uv2,
+                };
 
-                let a = ScreenVert {
-                    x: p0.x,
-                    y: p0.y,
-                    z: p0.z,
-                    inv_w: invw0,
-                    u_over_w: uv0.x * invw0,
-                    v_over_w: uv0.y * invw0,
-                };
-                let b = ScreenVert {
-                    x: p1.x,
-                    y: p1.y,
-                    z: p1.z,
-                    inv_w: invw1,
-                    u_over_w: uv1.x * invw1,
-                    v_over_w: uv1.y * invw1,
-                };
-                let c = ScreenVert {
-                    x: p2.x,
-                    y: p2.y,
-                    z: p2.z,
-                    inv_w: invw2,
-                    u_over_w: uv2.x * invw2,
-                    v_over_w: uv2.y * invw2,
-                };
-                draw_texture_tri(
-                    &mut d,
-                    &state.texture,
-                    a,
-                    b,
-                    c,
-                    &mut state.z_buffer,
-                    state.render_dims.x as usize,
-                    viewport_w,
-                    viewport_h,
-                );
+                let poly = clip_triangle(v0, v1, v2);
+                if poly.len() < 3 {
+                    continue;
+                }
+
+                // Fan triangulate.
+                let base = poly[0];
+                for k in 1..(poly.len() - 1) {
+                    let a = base;
+                    let b = poly[k];
+                    let c = poly[k + 1];
+
+                    if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
+                        continue;
+                    }
+
+                    // Perspective divide -> NDC.
+                    let invwa = 1.0 / a.clip.w;
+                    let invwb = 1.0 / b.clip.w;
+                    let invwc = 1.0 / c.clip.w;
+                    let ndc_a = Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
+                    let ndc_b = Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
+                    let ndc_c = Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
+
+                    // Backface cull in NDC (y up). CCW in NDC is the usual "front-face".
+                    let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
+                        - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
+                    if !DOUBLE_SIDED {
+                        if FRONT_FACE_CCW {
+                            if area_ndc <= 0.0 {
+                                continue;
+                            }
+                        } else if area_ndc >= 0.0 {
+                            continue;
+                        }
+                    }
+
+                    // NDC -> screen, keep UV/w for perspective-correct interpolation.
+                    let sc_a = ndc_to_sc(&ndc_a, render_resolution);
+                    let sc_b = ndc_to_sc(&ndc_b, render_resolution);
+                    let sc_c = ndc_to_sc(&ndc_c, render_resolution);
+
+                    let sa = ScreenVert {
+                        x: sc_a.x,
+                        y: sc_a.y,
+                        z: ndc_a.z,
+                        inv_w: invwa,
+                        u_over_w: a.uv.x * invwa,
+                        v_over_w: a.uv.y * invwa,
+                    };
+                    let sb = ScreenVert {
+                        x: sc_b.x,
+                        y: sc_b.y,
+                        z: ndc_b.z,
+                        inv_w: invwb,
+                        u_over_w: b.uv.x * invwb,
+                        v_over_w: b.uv.y * invwb,
+                    };
+                    let sc = ScreenVert {
+                        x: sc_c.x,
+                        y: sc_c.y,
+                        z: ndc_c.z,
+                        inv_w: invwc,
+                        u_over_w: c.uv.x * invwc,
+                        v_over_w: c.uv.y * invwc,
+                    };
+
+                    draw_texture_tri(
+                        &mut d,
+                        &state.texture,
+                        sa,
+                        sb,
+                        sc,
+                        &mut state.z_buffer,
+                        state.render_dims.x as usize,
+                        viewport_w,
+                        viewport_h,
+                    );
+                }
             }
         }
     }
@@ -441,6 +580,14 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
     // print the cam dir
     d.draw_text(
         &format!("Cam Dir: {:?}", state.cam.dir),
+        0,
+        cursor_y as i32,
+        FONT_SIZE,
+        Color::WHITE,
+    );
+    cursor_y += FONT_SIZE as f32;
+    d.draw_text(
+        &format!("Grid: {} x {} ({} cubes)", state.grid_dims, state.grid_dims, state.grid_dims * state.grid_dims),
         0,
         cursor_y as i32,
         FONT_SIZE,
