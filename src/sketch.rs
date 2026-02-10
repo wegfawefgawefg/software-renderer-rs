@@ -17,16 +17,19 @@ pub struct Cam {
 pub struct State {
     pub running: bool,
     pub time_since_last_update: f32,
+    pub sim_time: f32,
 
     pub cam: Cam,
     pub texture: image::DynamicImage,
 
     pub render_dims: glam::UVec2,
     pub z_buffer: Vec<f32>,
-    pub grid_dims: i32,
 
     pub cube: crate::model::Model,
     pub hill: crate::model::Model,
+    pub water: crate::model::Model,
+    pub water_base_verts: crate::model::Vertices,
+    pub palm: crate::model::Model,
     pub tree: crate::model::Model,
 }
 
@@ -38,9 +41,12 @@ impl State {
         });
 
         let z_len = (render_dims.x as usize) * (render_dims.y as usize);
+        let water = crate::model::gen_water_plane(24, 24, 30.0, 30.0, -0.9);
+        let water_base_verts = water.verts.clone();
         Self {
             running: true,
             time_since_last_update: 0.0,
+            sim_time: 0.0,
 
             cam: Cam {
                 pos: Vec3::new(0.0, 0.0, 2.0),
@@ -49,9 +55,11 @@ impl State {
             texture,
             render_dims,
             z_buffer: vec![f32::MAX; z_len],
-            grid_dims: 16,
             cube: load_cube(),
             hill: crate::model::gen_sandy_hill(10, 16, 6.0, 0.5),
+            water,
+            water_base_verts,
+            palm: crate::model::gen_palm_tree(),
             tree: load_from_obj("./treepot.obj"),
         }
     }
@@ -391,7 +399,9 @@ pub fn draw_solid_tri(
                 continue;
             }
 
-            z_buffer[idx] = z;
+            if color.a == 255 {
+                z_buffer[idx] = z;
+            }
             d.draw_pixel(x, y, color);
         }
     }
@@ -415,13 +425,6 @@ pub fn draw_tri(d: &mut impl RaylibDraw, verts: &[Vec3]) {
 pub fn process_events_and_input(rl: &mut RaylibHandle, state: &mut State) {
     if rl.is_key_pressed(raylib::consts::KeyboardKey::KEY_ESCAPE) {
         state.running = false;
-    }
-
-    if rl.is_key_pressed(raylib::consts::KeyboardKey::KEY_EQUAL) {
-        state.grid_dims = (state.grid_dims + 1).min(256);
-    }
-    if rl.is_key_pressed(raylib::consts::KeyboardKey::KEY_MINUS) {
-        state.grid_dims = (state.grid_dims - 1).max(1);
     }
 
     // move cam with wasd
@@ -475,6 +478,9 @@ pub fn step(rl: &mut RaylibHandle, rlt: &mut RaylibThread, state: &mut State) {
     // let pos = Vec3::new(t.sin() * D, 2.0, t.cos() * D);
     // let dir = (Vec3::ZERO - state.cam.pos).normalize();
     // state.cam = Cam { pos, dir };
+
+    // Fixed-step simulation time used for procedural animation (e.g. water waves).
+    state.sim_time += 1.0 / FRAMES_PER_SECOND as f32;
 }
 
 pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
@@ -482,6 +488,8 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
 
     let cube = &state.cube;
     let hill = &state.hill;
+    let water = &mut state.water;
+    let palm = &state.palm;
     let tree = &state.tree;
 
     // needed for transforming verts
@@ -496,9 +504,24 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
     // Explicit alpha blending (RGBA) for textures.
     let mut d = d.begin_blend_mode(BlendMode::BLEND_ALPHA);
 
+    // Animate water vertices (simple traveling wave).
+    {
+        let t = state.sim_time;
+        let amp = 0.45;
+        let kx = 0.28;
+        let kz = 0.22;
+        let speed = 1.0;
+        for (v, base) in water.verts.iter_mut().zip(state.water_base_verts.iter()) {
+            let x = base.x;
+            let z = base.z;
+            let wave = (x * kx + t * speed).sin() * (z * kz + t * (speed * 0.8)).cos();
+            v.y = base.y + amp * wave;
+        }
+    }
+
     // Draw hill first (opaque).
     {
-        let hill_pos = Vec3::new(0.0, -1.0, -10.0);
+        let hill_pos = Vec3::new(0.0, -1.6, -10.0);
         let hill_scale = Vec3::splat(1.0);
         let mvp = build_mvp(hill_pos, 0.0, hill_scale, &state.cam, aspect_ratio);
 
@@ -606,133 +629,223 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
         }
     }
 
-    // Cubes (textured) for performance testing.
+    // Draw water (semi-transparent), after hill so it alpha-blends over sand where visible.
     {
-        let grid: i32 = state.grid_dims;
-        let spacing = size * 1.25;
-        let start_x = -(grid as f32 - 1.0) * spacing * 0.5;
-        let start_z = -2.0;
+        let water_pos = Vec3::new(0.0, 0.0, -12.0);
+        let water_scale = Vec3::splat(1.0);
+        let mvp = build_mvp(water_pos, 0.0, water_scale, &state.cam, aspect_ratio);
 
-        for gz in 0..grid {
-            for gx in 0..grid {
-                let angle = 0.0;
-                let pos = Vec3::new(
-                    start_x + gx as f32 * spacing,
-                    0.0,
-                    start_z - gz as f32 * spacing,
-                );
-                let mvp = build_mvp(pos, angle, scale, &state.cam, aspect_ratio);
+        let mut clip_verts = Vec::with_capacity(water.verts.len());
+        for v in &water.verts {
+            clip_verts.push(mvp * v.extend(1.0));
+        }
 
-                let mut clip_verts = Vec::with_capacity(cube.verts.len());
-                for v in &cube.verts {
-                    clip_verts.push(mvp * v.extend(1.0));
+        for i in 0..water.tri_indices.len() {
+            let i0 = water.tri_indices[i][0] as usize;
+            let i1 = water.tri_indices[i][1] as usize;
+            let i2 = water.tri_indices[i][2] as usize;
+
+            let v0 = ClipVert {
+                clip: clip_verts[i0],
+                uv: Vec2::ZERO,
+            };
+            let v1 = ClipVert {
+                clip: clip_verts[i1],
+                uv: Vec2::ZERO,
+            };
+            let v2 = ClipVert {
+                clip: clip_verts[i2],
+                uv: Vec2::ZERO,
+            };
+
+            let poly = clip_triangle(v0, v1, v2);
+            if poly.len() < 3 {
+                continue;
+            }
+
+            let [r, g, b, a] = water.tri_colors[i];
+            let face_color = Color::new(r, g, b, a);
+
+            let base = poly[0];
+            for k in 1..(poly.len() - 1) {
+                let a = base;
+                let b = poly[k];
+                let c = poly[k + 1];
+
+                if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
+                    continue;
                 }
 
-                for i in 0..cube.tri_indices.len() {
-                    let i0 = cube.tri_indices[i][0] as usize;
-                    let i1 = cube.tri_indices[i][1] as usize;
-                    let i2 = cube.tri_indices[i][2] as usize;
+                let invwa = 1.0 / a.clip.w;
+                let invwb = 1.0 / b.clip.w;
+                let invwc = 1.0 / c.clip.w;
+                let ndc_a = Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
+                let ndc_b = Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
+                let ndc_c = Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
 
-                    let uv0 = cube.tri_tex_coords[i][0];
-                    let uv1 = cube.tri_tex_coords[i][1];
-                    let uv2 = cube.tri_tex_coords[i][2];
-
-                    let v0 = ClipVert {
-                        clip: clip_verts[i0],
-                        uv: uv0,
-                    };
-                    let v1 = ClipVert {
-                        clip: clip_verts[i1],
-                        uv: uv1,
-                    };
-                    let v2 = ClipVert {
-                        clip: clip_verts[i2],
-                        uv: uv2,
-                    };
-
-                    let poly = clip_triangle(v0, v1, v2);
-                    if poly.len() < 3 {
-                        continue;
-                    }
-
-                    // Fan triangulate.
-                    let base = poly[0];
-                    for k in 1..(poly.len() - 1) {
-                        let a = base;
-                        let b = poly[k];
-                        let c = poly[k + 1];
-
-                        if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
+                let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
+                    - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
+                if !DOUBLE_SIDED {
+                    if FRONT_FACE_CCW {
+                        if area_ndc <= 0.0 {
                             continue;
                         }
-
-                        // Perspective divide -> NDC.
-                        let invwa = 1.0 / a.clip.w;
-                        let invwb = 1.0 / b.clip.w;
-                        let invwc = 1.0 / c.clip.w;
-                        let ndc_a =
-                            Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
-                        let ndc_b =
-                            Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
-                        let ndc_c =
-                            Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
-
-                        // Backface cull in NDC (y up). CCW in NDC is the usual "front-face".
-                        let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
-                            - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
-                        if !DOUBLE_SIDED {
-                            if FRONT_FACE_CCW {
-                                if area_ndc <= 0.0 {
-                                    continue;
-                                }
-                            } else if area_ndc >= 0.0 {
-                                continue;
-                            }
-                        }
-
-                        // NDC -> screen, keep UV/w for perspective-correct interpolation.
-                        let sc_a = ndc_to_sc(&ndc_a, render_resolution);
-                        let sc_b = ndc_to_sc(&ndc_b, render_resolution);
-                        let sc_c = ndc_to_sc(&ndc_c, render_resolution);
-
-                        let sa = ScreenVert {
-                            x: sc_a.x,
-                            y: sc_a.y,
-                            z: ndc_a.z,
-                            inv_w: invwa,
-                            u_over_w: a.uv.x * invwa,
-                            v_over_w: a.uv.y * invwa,
-                        };
-                        let sb = ScreenVert {
-                            x: sc_b.x,
-                            y: sc_b.y,
-                            z: ndc_b.z,
-                            inv_w: invwb,
-                            u_over_w: b.uv.x * invwb,
-                            v_over_w: b.uv.y * invwb,
-                        };
-                        let sc = ScreenVert {
-                            x: sc_c.x,
-                            y: sc_c.y,
-                            z: ndc_c.z,
-                            inv_w: invwc,
-                            u_over_w: c.uv.x * invwc,
-                            v_over_w: c.uv.y * invwc,
-                        };
-
-                        draw_texture_tri(
-                            &mut d,
-                            &state.texture,
-                            sa,
-                            sb,
-                            sc,
-                            &mut state.z_buffer,
-                            state.render_dims.x as usize,
-                            viewport_w,
-                            viewport_h,
-                        );
+                    } else if area_ndc >= 0.0 {
+                        continue;
                     }
                 }
+
+                let sc_a = ndc_to_sc(&ndc_a, render_resolution);
+                let sc_b = ndc_to_sc(&ndc_b, render_resolution);
+                let sc_c = ndc_to_sc(&ndc_c, render_resolution);
+
+                let sa = ScreenVert {
+                    x: sc_a.x,
+                    y: sc_a.y,
+                    z: ndc_a.z,
+                    inv_w: invwa,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+                let sb = ScreenVert {
+                    x: sc_b.x,
+                    y: sc_b.y,
+                    z: ndc_b.z,
+                    inv_w: invwb,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+                let sc = ScreenVert {
+                    x: sc_c.x,
+                    y: sc_c.y,
+                    z: ndc_c.z,
+                    inv_w: invwc,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+
+                draw_solid_tri(
+                    &mut d,
+                    face_color,
+                    sa,
+                    sb,
+                    sc,
+                    &mut state.z_buffer,
+                    state.render_dims.x as usize,
+                    viewport_w,
+                    viewport_h,
+                );
+            }
+        }
+    }
+
+    // Draw palm (solid-color) sitting on the hill.
+    {
+        let palm_pos = Vec3::new(1.5, -1.6 + 1.35, -10.0); // roughly on hill surface
+        let palm_scale = Vec3::splat(1.0);
+        let mvp = build_mvp(palm_pos, 0.0, palm_scale, &state.cam, aspect_ratio);
+
+        let mut clip_verts = Vec::with_capacity(palm.verts.len());
+        for v in &palm.verts {
+            clip_verts.push(mvp * v.extend(1.0));
+        }
+
+        // Palm is solid-color: per-tri colors must exist.
+        for i in 0..palm.tri_indices.len() {
+            let i0 = palm.tri_indices[i][0] as usize;
+            let i1 = palm.tri_indices[i][1] as usize;
+            let i2 = palm.tri_indices[i][2] as usize;
+
+            let v0 = ClipVert {
+                clip: clip_verts[i0],
+                uv: Vec2::ZERO,
+            };
+            let v1 = ClipVert {
+                clip: clip_verts[i1],
+                uv: Vec2::ZERO,
+            };
+            let v2 = ClipVert {
+                clip: clip_verts[i2],
+                uv: Vec2::ZERO,
+            };
+
+            let poly = clip_triangle(v0, v1, v2);
+            if poly.len() < 3 {
+                continue;
+            }
+
+            let [r, g, b, a] = palm.tri_colors[i];
+            let face_color = Color::new(r, g, b, a);
+
+            let base = poly[0];
+            for k in 1..(poly.len() - 1) {
+                let a = base;
+                let b = poly[k];
+                let c = poly[k + 1];
+
+                if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
+                    continue;
+                }
+
+                let invwa = 1.0 / a.clip.w;
+                let invwb = 1.0 / b.clip.w;
+                let invwc = 1.0 / c.clip.w;
+                let ndc_a = Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
+                let ndc_b = Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
+                let ndc_c = Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
+
+                let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
+                    - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
+                if !DOUBLE_SIDED {
+                    if FRONT_FACE_CCW {
+                        if area_ndc <= 0.0 {
+                            continue;
+                        }
+                    } else if area_ndc >= 0.0 {
+                        continue;
+                    }
+                }
+
+                let sc_a = ndc_to_sc(&ndc_a, render_resolution);
+                let sc_b = ndc_to_sc(&ndc_b, render_resolution);
+                let sc_c = ndc_to_sc(&ndc_c, render_resolution);
+
+                let sa = ScreenVert {
+                    x: sc_a.x,
+                    y: sc_a.y,
+                    z: ndc_a.z,
+                    inv_w: invwa,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+                let sb = ScreenVert {
+                    x: sc_b.x,
+                    y: sc_b.y,
+                    z: ndc_b.z,
+                    inv_w: invwb,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+                let sc = ScreenVert {
+                    x: sc_c.x,
+                    y: sc_c.y,
+                    z: ndc_c.z,
+                    inv_w: invwc,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+
+                draw_solid_tri(
+                    &mut d,
+                    face_color,
+                    sa,
+                    sb,
+                    sc,
+                    &mut state.z_buffer,
+                    state.render_dims.x as usize,
+                    viewport_w,
+                    viewport_h,
+                );
             }
         }
     }
@@ -767,15 +880,6 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
         FONT_SIZE,
         Color::WHITE,
     );
-    cursor_y += FONT_SIZE as f32;
-    d.draw_text(
-        &format!("Grid: {} x {} ({} cubes)", state.grid_dims, state.grid_dims, state.grid_dims * state.grid_dims),
-        0,
-        cursor_y as i32,
-        FONT_SIZE,
-        Color::WHITE,
-    );
-
     let mouse_pos = d.get_mouse_position();
     d.draw_circle(mouse_pos.x as i32, mouse_pos.y as i32, 6.0, Color::GREEN);
 }
