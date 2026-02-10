@@ -156,6 +156,104 @@ pub fn gen_water_plane(nx: usize, nz: usize, width: f32, depth: f32, y: f32) -> 
     }
 }
 
+pub fn gen_foam_ring(
+    segments: usize,
+    inner_r: f32,
+    outer_r: f32,
+    y: f32,
+    alpha: u8,
+) -> Model {
+    // Flat trapezoidal ring (annulus strip) intended to sit slightly above water.
+    let segments = segments.max(8);
+    let inner_r = inner_r.max(0.01);
+    let outer_r = outer_r.max(inner_r + 0.01);
+
+    // Vertex layout: for i in [0..=segments], inner then outer.
+    let mut verts: Vertices = Vec::with_capacity((segments + 1) * 2);
+    for i in 0..=segments {
+        let t = i as f32 / segments as f32;
+        let phi = std::f32::consts::TAU * t;
+        let (c, s) = (phi.cos(), phi.sin());
+        verts.push(Vec3::new(c * inner_r, y, s * inner_r));
+        verts.push(Vec3::new(c * outer_r, y, s * outer_r));
+    }
+
+    let mut tri_indices: TriIndices = Vec::new();
+    let mut tri_colors: TriColors = Vec::new();
+
+    let base = [140u8, 210u8, 235u8, alpha];
+    let mut hash = 0xA53C9E37u32;
+    let hash_u32 = |x: u32| -> u32 {
+        let mut v = x.wrapping_mul(0x9E3779B9);
+        v ^= v >> 16;
+        v = v.wrapping_mul(0x85EBCA6B);
+        v ^= v >> 13;
+        v = v.wrapping_mul(0xC2B2AE35);
+        v ^= v >> 16;
+        v
+    };
+
+    for i in 0..segments {
+        // Add a few gaps so it's not a perfect ring.
+        hash = hash_u32(hash ^ (i as u32));
+        if (hash & 0xFF) < 28 {
+            continue; // ~11% gaps
+        }
+
+        let i0 = i * 2;
+        let i1 = i0 + 1;
+        let i2 = i0 + 2;
+        let i3 = i0 + 3;
+
+        // CCW from above (+Y): inner_i -> outer_{i+1} -> outer_i, etc.
+        tri_indices.push([i0, i3, i1]);
+        tri_indices.push([i0, i2, i3]);
+
+        // Slight per-quad shade jitter.
+        let jitter = ((hash >> 29) as i32) - 4; // [-4..+3]
+        let add = jitter * 4;
+        let mut c = base;
+        for ch in 0..3 {
+            c[ch] = ((c[ch] as i32) + add).clamp(0, 255) as u8;
+        }
+        tri_colors.push(c);
+        tri_colors.push(c);
+    }
+
+    Model {
+        verts,
+        tri_indices,
+        tri_tex_coords: Vec::new(),
+        tri_colors,
+    }
+}
+
+pub fn gen_solid_cube(base_color: [u8; 4]) -> Model {
+    // Solid-color cube using the existing 24-vertex cube (per-face seams).
+    let verts = crate::cube::get_cube_verts();
+    let tri_indices = crate::cube::gen_cube_tri_indices();
+    let mut tri_colors: TriColors = Vec::with_capacity(tri_indices.len());
+
+    for (ti, _t) in tri_indices.iter().enumerate() {
+        // Small deterministic jitter so faces read as "faceted".
+        let h = (ti as u32).wrapping_mul(2654435761);
+        let jitter = ((h >> 28) as i32) - 8; // [-8..+7]
+        let add = (jitter * 2) as i32;
+        let mut c = base_color;
+        for ch in 0..3 {
+            c[ch] = ((c[ch] as i32) + add).clamp(0, 255) as u8;
+        }
+        tri_colors.push(c);
+    }
+
+    Model {
+        verts,
+        tri_indices,
+        tri_tex_coords: Vec::new(),
+        tri_colors,
+    }
+}
+
 fn append_mesh(
     dst_verts: &mut Vertices,
     dst_tris: &mut TriIndices,

@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec2, Vec3, Vec4};
+use glam::{Mat4, Vec2, Vec3, Vec3Swizzles, Vec4};
 use image::{DynamicImage, GenericImageView};
 use raylib::prelude::*;
 
@@ -9,6 +9,21 @@ pub const FRAMES_PER_SECOND: u32 = 60;
 
 const DOUBLE_SIDED: bool = false;
 const FRONT_FACE_CCW: bool = true;
+
+// Water params (keep in one place so mesh deformation and queries match).
+const WATER_LOCAL_Y0: f32 = -0.9;
+const WATER_AMP: f32 = 0.45;
+const WATER_KX: f32 = 0.28;
+const WATER_KZ: f32 = 0.22;
+const WATER_SPEED: f32 = 1.0;
+const WATER_WORLD_POS: Vec3 = Vec3::new(0.0, 0.0, -12.0);
+
+#[derive(Clone, Copy, Debug)]
+pub struct FloatingBox {
+    pub xz: Vec2,
+    pub size: f32,
+    pub yaw: f32,
+}
 
 pub struct Cam {
     pub pos: Vec3,
@@ -33,7 +48,11 @@ pub struct State {
     pub grass: crate::model::Model,
     pub water: crate::model::Model,
     pub water_base_verts: crate::model::Vertices,
+    pub foam: crate::model::Model,
+    pub foam_base_verts: crate::model::Vertices,
     pub palm: crate::model::Model,
+    pub crate_box: crate::model::Model,
+    pub floating_boxes: Vec<FloatingBox>,
     pub tree: crate::model::Model,
 }
 
@@ -49,9 +68,12 @@ impl State {
         let hill_world_pos = Vec3::new(0.0, -1.6, -10.0);
         let hill_bvh = build_model_bvh(&hill, hill_world_pos, Vec3::splat(1.0));
         let grass = gen_grass_on_hill(&hill_bvh, 0xC0FFEEu32);
+        let floating_boxes = gen_floating_boxes(&hill_bvh, 0xB07B0A7u32);
 
-        let water = crate::model::gen_water_plane(24, 24, 30.0, 30.0, -0.9);
+        let water = crate::model::gen_water_plane(24, 24, 30.0, 30.0, WATER_LOCAL_Y0);
         let water_base_verts = water.verts.clone();
+        let foam = crate::model::gen_foam_ring(72, 5.2, 6.1, 0.0, 170);
+        let foam_base_verts = foam.verts.clone();
         Self {
             running: true,
             time_since_last_update: 0.0,
@@ -71,7 +93,11 @@ impl State {
             grass,
             water,
             water_base_verts,
+            foam,
+            foam_base_verts,
             palm: crate::model::gen_palm_tree(),
+            crate_box: crate::model::gen_solid_cube([150u8, 112u8, 76u8, 255u8]),
+            floating_boxes,
             tree: load_from_obj("./treepot.obj"),
         }
     }
@@ -193,6 +219,63 @@ fn gen_grass_on_hill(hill_bvh: &bvh::Bvh, seed0: u32) -> crate::model::Model {
         tri_tex_coords: Vec::new(),
         tri_colors,
     }
+}
+
+fn water_height_world(x: f32, z: f32, t: f32) -> f32 {
+    // Convert to water-local coords.
+    let lx = x - WATER_WORLD_POS.x;
+    let lz = z - WATER_WORLD_POS.z;
+    let wave = (lx * WATER_KX + t * WATER_SPEED).sin() * (lz * WATER_KZ + t * (WATER_SPEED * 0.8)).cos();
+    WATER_WORLD_POS.y + WATER_LOCAL_Y0 + WATER_AMP * wave
+}
+
+fn gen_floating_boxes(hill_bvh: &bvh::Bvh, seed0: u32) -> Vec<FloatingBox> {
+    let mut seed = seed0;
+    let hash_u32 = |x: u32| -> u32 {
+        let mut v = x.wrapping_mul(0x9E3779B9);
+        v ^= v >> 16;
+        v = v.wrapping_mul(0x85EBCA6B);
+        v ^= v >> 13;
+        v = v.wrapping_mul(0xC2B2AE35);
+        v ^= v >> 16;
+        v
+    };
+    let mut rand01 = || -> f32 {
+        seed = hash_u32(seed);
+        ((seed >> 8) as f32) / ((u32::MAX >> 8) as f32)
+    };
+
+    let mut out = Vec::new();
+    let target = 32;
+    let mut attempts = 0;
+    while out.len() < target && attempts < target * 50 {
+        attempts += 1;
+
+        // Spawn in a ring around the island center (x=0,z=-10), biased outward.
+        let r = 7.0 + rand01() * 10.0;
+        let a = std::f32::consts::TAU * rand01();
+        let x = r * a.cos();
+        let z = -10.0 + r * a.sin();
+
+        // Reject if it hits sand (so boxes stay in water).
+        let ray = bvh::Ray {
+            origin: Vec3::new(x, 50.0, z),
+            dir: Vec3::new(0.0, -1.0, 0.0),
+        };
+        if hill_bvh.raycast(&ray, 0.0, 200.0).is_some() {
+            continue;
+        }
+
+        let size = 0.35 + rand01() * 0.55;
+        let yaw = std::f32::consts::TAU * rand01();
+        out.push(FloatingBox {
+            xz: Vec2::new(x, z),
+            size,
+            yaw,
+        });
+    }
+
+    out
 }
 
 pub fn calc_normals(verts: &[Vec3], tri_indices: &TriIndices) -> Vec<Vec3> {
@@ -537,6 +620,120 @@ pub fn draw_solid_tri(
     }
 }
 
+fn draw_solid_model(
+    d: &mut impl RaylibDraw,
+    model: &crate::model::Model,
+    mvp: Mat4,
+    render_resolution: Vec2,
+    z_buffer: &mut [f32],
+    z_buffer_w: usize,
+    viewport_w: i32,
+    viewport_h: i32,
+) {
+    let mut clip_verts = Vec::with_capacity(model.verts.len());
+    for v in &model.verts {
+        clip_verts.push(mvp * v.extend(1.0));
+    }
+
+    for i in 0..model.tri_indices.len() {
+        let i0 = model.tri_indices[i][0] as usize;
+        let i1 = model.tri_indices[i][1] as usize;
+        let i2 = model.tri_indices[i][2] as usize;
+
+        let v0 = ClipVert {
+            clip: clip_verts[i0],
+            uv: Vec2::ZERO,
+        };
+        let v1 = ClipVert {
+            clip: clip_verts[i1],
+            uv: Vec2::ZERO,
+        };
+        let v2 = ClipVert {
+            clip: clip_verts[i2],
+            uv: Vec2::ZERO,
+        };
+
+        let poly = clip_triangle(v0, v1, v2);
+        if poly.len() < 3 {
+            continue;
+        }
+
+        let [r, g, b, a] = model.tri_colors[i];
+        let face_color = Color::new(r, g, b, a);
+
+        let base = poly[0];
+        for k in 1..(poly.len() - 1) {
+            let a = base;
+            let b = poly[k];
+            let c = poly[k + 1];
+
+            if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
+                continue;
+            }
+
+            let invwa = 1.0 / a.clip.w;
+            let invwb = 1.0 / b.clip.w;
+            let invwc = 1.0 / c.clip.w;
+            let ndc_a = Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
+            let ndc_b = Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
+            let ndc_c = Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
+
+            let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
+                - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
+            if !DOUBLE_SIDED {
+                if FRONT_FACE_CCW {
+                    if area_ndc <= 0.0 {
+                        continue;
+                    }
+                } else if area_ndc >= 0.0 {
+                    continue;
+                }
+            }
+
+            let sc_a = ndc_to_sc(&ndc_a, render_resolution);
+            let sc_b = ndc_to_sc(&ndc_b, render_resolution);
+            let sc_c = ndc_to_sc(&ndc_c, render_resolution);
+
+            let sa = ScreenVert {
+                x: sc_a.x,
+                y: sc_a.y,
+                z: ndc_a.z,
+                inv_w: invwa,
+                u_over_w: 0.0,
+                v_over_w: 0.0,
+            };
+            let sb = ScreenVert {
+                x: sc_b.x,
+                y: sc_b.y,
+                z: ndc_b.z,
+                inv_w: invwb,
+                u_over_w: 0.0,
+                v_over_w: 0.0,
+            };
+            let sc = ScreenVert {
+                x: sc_c.x,
+                y: sc_c.y,
+                z: ndc_c.z,
+                inv_w: invwc,
+                u_over_w: 0.0,
+                v_over_w: 0.0,
+            };
+
+            draw_solid_tri(
+                d,
+                face_color,
+                sa,
+                sb,
+                sc,
+                z_buffer,
+                z_buffer_w,
+                viewport_w,
+                viewport_h,
+            );
+        }
+    }
+}
+
 pub fn draw_tri(d: &mut impl RaylibDraw, verts: &[Vec3]) {
     // draw lines connecting the vertices
     for i in 0..verts.len() {
@@ -621,6 +818,9 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
     let water = &mut state.water;
     let palm = &state.palm;
     let grass = &state.grass;
+    let foam = &mut state.foam;
+    let crate_box = &state.crate_box;
+    let floating_boxes = &state.floating_boxes;
     let tree = &state.tree;
 
     // needed for transforming verts
@@ -638,15 +838,12 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
     // Animate water vertices (simple traveling wave).
     {
         let t = state.sim_time;
-        let amp = 0.45;
-        let kx = 0.28;
-        let kz = 0.22;
-        let speed = 1.0;
         for (v, base) in water.verts.iter_mut().zip(state.water_base_verts.iter()) {
             let x = base.x;
             let z = base.z;
-            let wave = (x * kx + t * speed).sin() * (z * kz + t * (speed * 0.8)).cos();
-            v.y = base.y + amp * wave;
+            let wave = (x * WATER_KX + t * WATER_SPEED).sin()
+                * (z * WATER_KZ + t * (WATER_SPEED * 0.8)).cos();
+            v.y = base.y + WATER_AMP * wave;
         }
     }
 
@@ -655,327 +852,31 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
         let hill_pos = state.hill_world_pos;
         let hill_scale = Vec3::splat(1.0);
         let mvp = build_mvp(hill_pos, 0.0, hill_scale, &state.cam, aspect_ratio);
-
-        let mut clip_verts = Vec::with_capacity(hill.verts.len());
-        for v in &hill.verts {
-            clip_verts.push(mvp * v.extend(1.0));
-        }
-
-        for i in 0..hill.tri_indices.len() {
-            let i0 = hill.tri_indices[i][0] as usize;
-            let i1 = hill.tri_indices[i][1] as usize;
-            let i2 = hill.tri_indices[i][2] as usize;
-
-            let v0 = ClipVert {
-                clip: clip_verts[i0],
-                uv: Vec2::ZERO,
-            };
-            let v1 = ClipVert {
-                clip: clip_verts[i1],
-                uv: Vec2::ZERO,
-            };
-            let v2 = ClipVert {
-                clip: clip_verts[i2],
-                uv: Vec2::ZERO,
-            };
-
-            let poly = clip_triangle(v0, v1, v2);
-            if poly.len() < 3 {
-                continue;
-            }
-
-            let [r, g, b, a] = hill.tri_colors[i];
-            let face_color = Color::new(r, g, b, a);
-
-            let base = poly[0];
-            for k in 1..(poly.len() - 1) {
-                let a = base;
-                let b = poly[k];
-                let c = poly[k + 1];
-
-                if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
-                    continue;
-                }
-
-                let invwa = 1.0 / a.clip.w;
-                let invwb = 1.0 / b.clip.w;
-                let invwc = 1.0 / c.clip.w;
-                let ndc_a = Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
-                let ndc_b = Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
-                let ndc_c = Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
-
-                let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
-                    - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
-                if !DOUBLE_SIDED {
-                    if FRONT_FACE_CCW {
-                        if area_ndc <= 0.0 {
-                            continue;
-                        }
-                    } else if area_ndc >= 0.0 {
-                        continue;
-                    }
-                }
-
-                let sc_a = ndc_to_sc(&ndc_a, render_resolution);
-                let sc_b = ndc_to_sc(&ndc_b, render_resolution);
-                let sc_c = ndc_to_sc(&ndc_c, render_resolution);
-
-                let sa = ScreenVert {
-                    x: sc_a.x,
-                    y: sc_a.y,
-                    z: ndc_a.z,
-                    inv_w: invwa,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-                let sb = ScreenVert {
-                    x: sc_b.x,
-                    y: sc_b.y,
-                    z: ndc_b.z,
-                    inv_w: invwb,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-                let sc = ScreenVert {
-                    x: sc_c.x,
-                    y: sc_c.y,
-                    z: ndc_c.z,
-                    inv_w: invwc,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-
-                draw_solid_tri(
-                    &mut d,
-                    face_color,
-                    sa,
-                    sb,
-                    sc,
-                    &mut state.z_buffer,
-                    state.render_dims.x as usize,
-                    viewport_w,
-                    viewport_h,
-                );
-            }
-        }
+        draw_solid_model(
+            &mut d,
+            hill,
+            mvp,
+            render_resolution,
+            &mut state.z_buffer,
+            state.render_dims.x as usize,
+            viewport_w,
+            viewport_h,
+        );
     }
 
     // Draw grass patches (solid-color), on top of the hill.
     {
         let mvp = build_mvp(Vec3::ZERO, 0.0, Vec3::splat(1.0), &state.cam, aspect_ratio);
-
-        let mut clip_verts = Vec::with_capacity(grass.verts.len());
-        for v in &grass.verts {
-            clip_verts.push(mvp * v.extend(1.0));
-        }
-
-        for i in 0..grass.tri_indices.len() {
-            let i0 = grass.tri_indices[i][0] as usize;
-            let i1 = grass.tri_indices[i][1] as usize;
-            let i2 = grass.tri_indices[i][2] as usize;
-
-            let v0 = ClipVert {
-                clip: clip_verts[i0],
-                uv: Vec2::ZERO,
-            };
-            let v1 = ClipVert {
-                clip: clip_verts[i1],
-                uv: Vec2::ZERO,
-            };
-            let v2 = ClipVert {
-                clip: clip_verts[i2],
-                uv: Vec2::ZERO,
-            };
-
-            let poly = clip_triangle(v0, v1, v2);
-            if poly.len() < 3 {
-                continue;
-            }
-
-            let [r, g, b, a] = grass.tri_colors[i];
-            let face_color = Color::new(r, g, b, a);
-
-            let base = poly[0];
-            for k in 1..(poly.len() - 1) {
-                let a = base;
-                let b = poly[k];
-                let c = poly[k + 1];
-
-                if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
-                    continue;
-                }
-
-                let invwa = 1.0 / a.clip.w;
-                let invwb = 1.0 / b.clip.w;
-                let invwc = 1.0 / c.clip.w;
-                let ndc_a = Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
-                let ndc_b = Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
-                let ndc_c = Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
-
-                let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
-                    - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
-                if !DOUBLE_SIDED {
-                    if FRONT_FACE_CCW {
-                        if area_ndc <= 0.0 {
-                            continue;
-                        }
-                    } else if area_ndc >= 0.0 {
-                        continue;
-                    }
-                }
-
-                let sc_a = ndc_to_sc(&ndc_a, render_resolution);
-                let sc_b = ndc_to_sc(&ndc_b, render_resolution);
-                let sc_c = ndc_to_sc(&ndc_c, render_resolution);
-
-                let sa = ScreenVert {
-                    x: sc_a.x,
-                    y: sc_a.y,
-                    z: ndc_a.z,
-                    inv_w: invwa,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-                let sb = ScreenVert {
-                    x: sc_b.x,
-                    y: sc_b.y,
-                    z: ndc_b.z,
-                    inv_w: invwb,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-                let sc = ScreenVert {
-                    x: sc_c.x,
-                    y: sc_c.y,
-                    z: ndc_c.z,
-                    inv_w: invwc,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-
-                draw_solid_tri(
-                    &mut d,
-                    face_color,
-                    sa,
-                    sb,
-                    sc,
-                    &mut state.z_buffer,
-                    state.render_dims.x as usize,
-                    viewport_w,
-                    viewport_h,
-                );
-            }
-        }
-    }
-
-    // Draw water (semi-transparent), after hill so it alpha-blends over sand where visible.
-    {
-        let water_pos = Vec3::new(0.0, 0.0, -12.0);
-        let water_scale = Vec3::splat(1.0);
-        let mvp = build_mvp(water_pos, 0.0, water_scale, &state.cam, aspect_ratio);
-
-        let mut clip_verts = Vec::with_capacity(water.verts.len());
-        for v in &water.verts {
-            clip_verts.push(mvp * v.extend(1.0));
-        }
-
-        for i in 0..water.tri_indices.len() {
-            let i0 = water.tri_indices[i][0] as usize;
-            let i1 = water.tri_indices[i][1] as usize;
-            let i2 = water.tri_indices[i][2] as usize;
-
-            let v0 = ClipVert {
-                clip: clip_verts[i0],
-                uv: Vec2::ZERO,
-            };
-            let v1 = ClipVert {
-                clip: clip_verts[i1],
-                uv: Vec2::ZERO,
-            };
-            let v2 = ClipVert {
-                clip: clip_verts[i2],
-                uv: Vec2::ZERO,
-            };
-
-            let poly = clip_triangle(v0, v1, v2);
-            if poly.len() < 3 {
-                continue;
-            }
-
-            let [r, g, b, a] = water.tri_colors[i];
-            let face_color = Color::new(r, g, b, a);
-
-            let base = poly[0];
-            for k in 1..(poly.len() - 1) {
-                let a = base;
-                let b = poly[k];
-                let c = poly[k + 1];
-
-                if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
-                    continue;
-                }
-
-                let invwa = 1.0 / a.clip.w;
-                let invwb = 1.0 / b.clip.w;
-                let invwc = 1.0 / c.clip.w;
-                let ndc_a = Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
-                let ndc_b = Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
-                let ndc_c = Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
-
-                let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
-                    - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
-                if !DOUBLE_SIDED {
-                    if FRONT_FACE_CCW {
-                        if area_ndc <= 0.0 {
-                            continue;
-                        }
-                    } else if area_ndc >= 0.0 {
-                        continue;
-                    }
-                }
-
-                let sc_a = ndc_to_sc(&ndc_a, render_resolution);
-                let sc_b = ndc_to_sc(&ndc_b, render_resolution);
-                let sc_c = ndc_to_sc(&ndc_c, render_resolution);
-
-                let sa = ScreenVert {
-                    x: sc_a.x,
-                    y: sc_a.y,
-                    z: ndc_a.z,
-                    inv_w: invwa,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-                let sb = ScreenVert {
-                    x: sc_b.x,
-                    y: sc_b.y,
-                    z: ndc_b.z,
-                    inv_w: invwb,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-                let sc = ScreenVert {
-                    x: sc_c.x,
-                    y: sc_c.y,
-                    z: ndc_c.z,
-                    inv_w: invwc,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-
-                draw_solid_tri(
-                    &mut d,
-                    face_color,
-                    sa,
-                    sb,
-                    sc,
-                    &mut state.z_buffer,
-                    state.render_dims.x as usize,
-                    viewport_w,
-                    viewport_h,
-                );
-            }
-        }
+        draw_solid_model(
+            &mut d,
+            grass,
+            mvp,
+            render_resolution,
+            &mut state.z_buffer,
+            state.render_dims.x as usize,
+            viewport_w,
+            viewport_h,
+        );
     }
 
     // Draw palm (solid-color) sitting on the hill.
@@ -988,116 +889,104 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
         };
         let hit = state.hill_bvh.raycast(&ray, 0.0, 200.0);
         let palm_pos = if let Some(h) = hit {
-            h.pos + Vec3::new(0.0, -0.20, 0.0)
+            h.pos + Vec3::new(0.0, -0.28, 0.0)
         } else {
             Vec3::new(palm_xz.x, -0.25, palm_xz.y)
         };
         let palm_scale = Vec3::splat(1.0);
         let mvp = build_mvp(palm_pos, 0.0, palm_scale, &state.cam, aspect_ratio);
+        draw_solid_model(
+            &mut d,
+            palm,
+            mvp,
+            render_resolution,
+            &mut state.z_buffer,
+            state.render_dims.x as usize,
+            viewport_w,
+            viewport_h,
+        );
+    }
 
-        let mut clip_verts = Vec::with_capacity(palm.verts.len());
-        for v in &palm.verts {
-            clip_verts.push(mvp * v.extend(1.0));
+    // Draw floating boxes (opaque) before drawing transparent water.
+    {
+        let t = state.sim_time;
+        for b in floating_boxes {
+            let water_y = water_height_world(b.xz.x, b.xz.y, t);
+            // 30% submerged => center sits 0.2*size above waterline.
+            let submerged = 0.30;
+            let center_y = water_y + (0.5 - submerged) * b.size;
+
+            // Gentle bob and slow spin.
+            let y = center_y + 0.03 * (t * 1.7 + b.yaw).sin();
+            let rot = b.yaw + t * 0.15;
+            let pos = Vec3::new(b.xz.x, y, b.xz.y);
+            let scale = Vec3::splat(b.size);
+            let mvp = build_mvp(pos, rot, scale, &state.cam, aspect_ratio);
+            draw_solid_model(
+                &mut d,
+                crate_box,
+                mvp,
+                render_resolution,
+                &mut state.z_buffer,
+                state.render_dims.x as usize,
+                viewport_w,
+                viewport_h,
+            );
+        }
+    }
+
+    // Draw water (semi-transparent), after opaque objects so it alpha-blends correctly.
+    {
+        let mvp = build_mvp(WATER_WORLD_POS, 0.0, Vec3::splat(1.0), &state.cam, aspect_ratio);
+        draw_solid_model(
+            &mut d,
+            water,
+            mvp,
+            render_resolution,
+            &mut state.z_buffer,
+            state.render_dims.x as usize,
+            viewport_w,
+            viewport_h,
+        );
+    }
+
+    // Draw sea foam ring (semi-transparent) slightly above the waterline.
+    {
+        let t = state.sim_time;
+        let amp = 0.18;
+        let freq = 6.0;
+        for (idx, (v, base)) in foam
+            .verts
+            .iter_mut()
+            .zip(state.foam_base_verts.iter())
+            .enumerate()
+        {
+            let phi = base.z.atan2(base.x);
+            let is_outer = (idx & 1) == 1;
+            let r0 = base.xz().length();
+            let wave = (phi * freq + t * 1.4).sin();
+            let edge = if is_outer { 1.0 } else { 0.55 };
+            let dr = amp * wave * edge;
+            let r = (r0 + dr).max(0.01);
+            let (c, s) = (phi.cos(), phi.sin());
+            v.x = c * r;
+            v.z = s * r;
+            v.y = 0.0;
         }
 
-        // Palm is solid-color: per-tri colors must exist.
-        for i in 0..palm.tri_indices.len() {
-            let i0 = palm.tri_indices[i][0] as usize;
-            let i1 = palm.tri_indices[i][1] as usize;
-            let i2 = palm.tri_indices[i][2] as usize;
-
-            let v0 = ClipVert {
-                clip: clip_verts[i0],
-                uv: Vec2::ZERO,
-            };
-            let v1 = ClipVert {
-                clip: clip_verts[i1],
-                uv: Vec2::ZERO,
-            };
-            let v2 = ClipVert {
-                clip: clip_verts[i2],
-                uv: Vec2::ZERO,
-            };
-
-            let poly = clip_triangle(v0, v1, v2);
-            if poly.len() < 3 {
-                continue;
-            }
-
-            let [r, g, b, a] = palm.tri_colors[i];
-            let face_color = Color::new(r, g, b, a);
-
-            let base = poly[0];
-            for k in 1..(poly.len() - 1) {
-                let a = base;
-                let b = poly[k];
-                let c = poly[k + 1];
-
-                if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
-                    continue;
-                }
-
-                let invwa = 1.0 / a.clip.w;
-                let invwb = 1.0 / b.clip.w;
-                let invwc = 1.0 / c.clip.w;
-                let ndc_a = Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
-                let ndc_b = Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
-                let ndc_c = Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
-
-                let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
-                    - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
-                if !DOUBLE_SIDED {
-                    if FRONT_FACE_CCW {
-                        if area_ndc <= 0.0 {
-                            continue;
-                        }
-                    } else if area_ndc >= 0.0 {
-                        continue;
-                    }
-                }
-
-                let sc_a = ndc_to_sc(&ndc_a, render_resolution);
-                let sc_b = ndc_to_sc(&ndc_b, render_resolution);
-                let sc_c = ndc_to_sc(&ndc_c, render_resolution);
-
-                let sa = ScreenVert {
-                    x: sc_a.x,
-                    y: sc_a.y,
-                    z: ndc_a.z,
-                    inv_w: invwa,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-                let sb = ScreenVert {
-                    x: sc_b.x,
-                    y: sc_b.y,
-                    z: ndc_b.z,
-                    inv_w: invwb,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-                let sc = ScreenVert {
-                    x: sc_c.x,
-                    y: sc_c.y,
-                    z: ndc_c.z,
-                    inv_w: invwc,
-                    u_over_w: 0.0,
-                    v_over_w: 0.0,
-                };
-
-                draw_solid_tri(
-                    &mut d,
-                    face_color,
-                    sa,
-                    sb,
-                    sc,
-                    &mut state.z_buffer,
-                    state.render_dims.x as usize,
-                    viewport_w,
-                    viewport_h,
-                );
-            }
-        }
+        // Place around the island at roughly the waterline height.
+        let foam_pos = Vec3::new(0.0, WATER_WORLD_POS.y + WATER_LOCAL_Y0 + 0.02, -10.0);
+        let mvp = build_mvp(foam_pos, 0.0, Vec3::splat(1.0), &state.cam, aspect_ratio);
+        draw_solid_model(
+            &mut d,
+            foam,
+            mvp,
+            render_resolution,
+            &mut state.z_buffer,
+            state.render_dims.x as usize,
+            viewport_w,
+            viewport_h,
+        );
     }
 
     let frame_time = d.get_frame_time();
