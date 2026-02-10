@@ -26,6 +26,7 @@ pub struct State {
     pub grid_dims: i32,
 
     pub cube: crate::model::Model,
+    pub hill: crate::model::Model,
     pub tree: crate::model::Model,
 }
 
@@ -50,6 +51,7 @@ impl State {
             z_buffer: vec![f32::MAX; z_len],
             grid_dims: 16,
             cube: load_cube(),
+            hill: crate::model::gen_sandy_hill(10, 16, 6.0, 0.5),
             tree: load_from_obj("./treepot.obj"),
         }
     }
@@ -331,6 +333,70 @@ pub fn draw_texture_tri(
     }
 }
 
+pub fn draw_solid_tri(
+    d: &mut impl RaylibDraw,
+    color: Color,
+    a: ScreenVert,
+    b: ScreenVert,
+    c: ScreenVert,
+    z_buffer: &mut [f32],
+    z_buffer_w: usize,
+    viewport_w: i32,
+    viewport_h: i32,
+) {
+    // Bounding box.
+    let minx_f = a.x.min(b.x).min(c.x);
+    let maxx_f = a.x.max(b.x).max(c.x);
+    let miny_f = a.y.min(b.y).min(c.y);
+    let maxy_f = a.y.max(b.y).max(c.y);
+
+    let minx = (minx_f.floor() as i32).max(0);
+    let maxx = (maxx_f.ceil() as i32).min(viewport_w - 1);
+    let miny = (miny_f.floor() as i32).max(0);
+    let maxy = (maxy_f.ceil() as i32).min(viewport_h - 1);
+    if minx > maxx || miny > maxy {
+        return;
+    }
+
+    let area = edge_fn(a.x, a.y, b.x, b.y, c.x, c.y);
+    if area == 0.0 {
+        return;
+    }
+    let inv_area = 1.0 / area;
+
+    for y in miny..=maxy {
+        let py = y as f32 + 0.5;
+        for x in minx..=maxx {
+            let px = x as f32 + 0.5;
+            let w0 = edge_fn(b.x, b.y, c.x, c.y, px, py);
+            let w1 = edge_fn(c.x, c.y, a.x, a.y, px, py);
+            let w2 = edge_fn(a.x, a.y, b.x, b.y, px, py);
+
+            // Inside test supports both windings (area sign).
+            if area > 0.0 {
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                    continue;
+                }
+            } else if w0 > 0.0 || w1 > 0.0 || w2 > 0.0 {
+                continue;
+            }
+
+            let alpha = w0 * inv_area;
+            let beta = w1 * inv_area;
+            let gamma = w2 * inv_area;
+
+            let z = alpha * a.z + beta * b.z + gamma * c.z;
+            let idx = (y as usize) * z_buffer_w + (x as usize);
+            if z >= z_buffer[idx] {
+                continue;
+            }
+
+            z_buffer[idx] = z;
+            d.draw_pixel(x, y, color);
+        }
+    }
+}
+
 pub fn draw_tri(d: &mut impl RaylibDraw, verts: &[Vec3]) {
     // draw lines connecting the vertices
     for i in 0..verts.len() {
@@ -415,6 +481,7 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
     state.z_buffer.fill(f32::INFINITY);
 
     let cube = &state.cube;
+    let hill = &state.hill;
     let tree = &state.tree;
 
     // needed for transforming verts
@@ -429,127 +496,242 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
     // Explicit alpha blending (RGBA) for textures.
     let mut d = d.begin_blend_mode(BlendMode::BLEND_ALPHA);
 
-    let grid: i32 = state.grid_dims;
-    let spacing = size * 1.25;
-    let start_x = -(grid as f32 - 1.0) * spacing * 0.5;
-    let start_z = -2.0;
+    // Draw hill first (opaque).
+    {
+        let hill_pos = Vec3::new(0.0, -1.0, -10.0);
+        let hill_scale = Vec3::splat(1.0);
+        let mvp = build_mvp(hill_pos, 0.0, hill_scale, &state.cam, aspect_ratio);
 
-    for gz in 0..grid {
-        for gx in 0..grid {
-            let angle = 0.0;
-            let pos = Vec3::new(
-                start_x + gx as f32 * spacing,
-                0.0,
-                start_z - gz as f32 * spacing,
-            );
-            let mvp = build_mvp(pos, angle, scale, &state.cam, aspect_ratio);
+        let mut clip_verts = Vec::with_capacity(hill.verts.len());
+        for v in &hill.verts {
+            clip_verts.push(mvp * v.extend(1.0));
+        }
 
-            ////////  calc clip space vertices    ////////
-            let mut clip_verts = Vec::with_capacity(cube.verts.len());
-            for v in &cube.verts {
-                clip_verts.push(mvp * v.extend(1.0));
+        for i in 0..hill.tri_indices.len() {
+            let i0 = hill.tri_indices[i][0] as usize;
+            let i1 = hill.tri_indices[i][1] as usize;
+            let i2 = hill.tri_indices[i][2] as usize;
+
+            let v0 = ClipVert {
+                clip: clip_verts[i0],
+                uv: Vec2::ZERO,
+            };
+            let v1 = ClipVert {
+                clip: clip_verts[i1],
+                uv: Vec2::ZERO,
+            };
+            let v2 = ClipVert {
+                clip: clip_verts[i2],
+                uv: Vec2::ZERO,
+            };
+
+            let poly = clip_triangle(v0, v1, v2);
+            if poly.len() < 3 {
+                continue;
             }
 
-            for i in 0..cube.tri_indices.len() {
-                let i0 = cube.tri_indices[i][0] as usize;
-                let i1 = cube.tri_indices[i][1] as usize;
-                let i2 = cube.tri_indices[i][2] as usize;
+            let [r, g, b, a] = hill.tri_colors[i];
+            let face_color = Color::new(r, g, b, a);
 
-                let uv0 = cube.tri_tex_coords[i][0];
-                let uv1 = cube.tri_tex_coords[i][1];
-                let uv2 = cube.tri_tex_coords[i][2];
+            let base = poly[0];
+            for k in 1..(poly.len() - 1) {
+                let a = base;
+                let b = poly[k];
+                let c = poly[k + 1];
 
-                let v0 = ClipVert {
-                    clip: clip_verts[i0],
-                    uv: uv0,
-                };
-                let v1 = ClipVert {
-                    clip: clip_verts[i1],
-                    uv: uv1,
-                };
-                let v2 = ClipVert {
-                    clip: clip_verts[i2],
-                    uv: uv2,
-                };
-
-                let poly = clip_triangle(v0, v1, v2);
-                if poly.len() < 3 {
+                if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
                     continue;
                 }
 
-                // Fan triangulate.
-                let base = poly[0];
-                for k in 1..(poly.len() - 1) {
-                    let a = base;
-                    let b = poly[k];
-                    let c = poly[k + 1];
+                let invwa = 1.0 / a.clip.w;
+                let invwb = 1.0 / b.clip.w;
+                let invwc = 1.0 / c.clip.w;
+                let ndc_a = Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
+                let ndc_b = Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
+                let ndc_c = Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
 
-                    if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
+                let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
+                    - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
+                if !DOUBLE_SIDED {
+                    if FRONT_FACE_CCW {
+                        if area_ndc <= 0.0 {
+                            continue;
+                        }
+                    } else if area_ndc >= 0.0 {
+                        continue;
+                    }
+                }
+
+                let sc_a = ndc_to_sc(&ndc_a, render_resolution);
+                let sc_b = ndc_to_sc(&ndc_b, render_resolution);
+                let sc_c = ndc_to_sc(&ndc_c, render_resolution);
+
+                let sa = ScreenVert {
+                    x: sc_a.x,
+                    y: sc_a.y,
+                    z: ndc_a.z,
+                    inv_w: invwa,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+                let sb = ScreenVert {
+                    x: sc_b.x,
+                    y: sc_b.y,
+                    z: ndc_b.z,
+                    inv_w: invwb,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+                let sc = ScreenVert {
+                    x: sc_c.x,
+                    y: sc_c.y,
+                    z: ndc_c.z,
+                    inv_w: invwc,
+                    u_over_w: 0.0,
+                    v_over_w: 0.0,
+                };
+
+                draw_solid_tri(
+                    &mut d,
+                    face_color,
+                    sa,
+                    sb,
+                    sc,
+                    &mut state.z_buffer,
+                    state.render_dims.x as usize,
+                    viewport_w,
+                    viewport_h,
+                );
+            }
+        }
+    }
+
+    // Cubes (textured) for performance testing.
+    {
+        let grid: i32 = state.grid_dims;
+        let spacing = size * 1.25;
+        let start_x = -(grid as f32 - 1.0) * spacing * 0.5;
+        let start_z = -2.0;
+
+        for gz in 0..grid {
+            for gx in 0..grid {
+                let angle = 0.0;
+                let pos = Vec3::new(
+                    start_x + gx as f32 * spacing,
+                    0.0,
+                    start_z - gz as f32 * spacing,
+                );
+                let mvp = build_mvp(pos, angle, scale, &state.cam, aspect_ratio);
+
+                let mut clip_verts = Vec::with_capacity(cube.verts.len());
+                for v in &cube.verts {
+                    clip_verts.push(mvp * v.extend(1.0));
+                }
+
+                for i in 0..cube.tri_indices.len() {
+                    let i0 = cube.tri_indices[i][0] as usize;
+                    let i1 = cube.tri_indices[i][1] as usize;
+                    let i2 = cube.tri_indices[i][2] as usize;
+
+                    let uv0 = cube.tri_tex_coords[i][0];
+                    let uv1 = cube.tri_tex_coords[i][1];
+                    let uv2 = cube.tri_tex_coords[i][2];
+
+                    let v0 = ClipVert {
+                        clip: clip_verts[i0],
+                        uv: uv0,
+                    };
+                    let v1 = ClipVert {
+                        clip: clip_verts[i1],
+                        uv: uv1,
+                    };
+                    let v2 = ClipVert {
+                        clip: clip_verts[i2],
+                        uv: uv2,
+                    };
+
+                    let poly = clip_triangle(v0, v1, v2);
+                    if poly.len() < 3 {
                         continue;
                     }
 
-                    // Perspective divide -> NDC.
-                    let invwa = 1.0 / a.clip.w;
-                    let invwb = 1.0 / b.clip.w;
-                    let invwc = 1.0 / c.clip.w;
-                    let ndc_a = Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
-                    let ndc_b = Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
-                    let ndc_c = Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
+                    // Fan triangulate.
+                    let base = poly[0];
+                    for k in 1..(poly.len() - 1) {
+                        let a = base;
+                        let b = poly[k];
+                        let c = poly[k + 1];
 
-                    // Backface cull in NDC (y up). CCW in NDC is the usual "front-face".
-                    let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
-                        - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
-                    if !DOUBLE_SIDED {
-                        if FRONT_FACE_CCW {
-                            if area_ndc <= 0.0 {
-                                continue;
-                            }
-                        } else if area_ndc >= 0.0 {
+                        if a.clip.w == 0.0 || b.clip.w == 0.0 || c.clip.w == 0.0 {
                             continue;
                         }
+
+                        // Perspective divide -> NDC.
+                        let invwa = 1.0 / a.clip.w;
+                        let invwb = 1.0 / b.clip.w;
+                        let invwc = 1.0 / c.clip.w;
+                        let ndc_a =
+                            Vec3::new(a.clip.x * invwa, a.clip.y * invwa, a.clip.z * invwa);
+                        let ndc_b =
+                            Vec3::new(b.clip.x * invwb, b.clip.y * invwb, b.clip.z * invwb);
+                        let ndc_c =
+                            Vec3::new(c.clip.x * invwc, c.clip.y * invwc, c.clip.z * invwc);
+
+                        // Backface cull in NDC (y up). CCW in NDC is the usual "front-face".
+                        let area_ndc = (ndc_b.x - ndc_a.x) * (ndc_c.y - ndc_a.y)
+                            - (ndc_b.y - ndc_a.y) * (ndc_c.x - ndc_a.x);
+                        if !DOUBLE_SIDED {
+                            if FRONT_FACE_CCW {
+                                if area_ndc <= 0.0 {
+                                    continue;
+                                }
+                            } else if area_ndc >= 0.0 {
+                                continue;
+                            }
+                        }
+
+                        // NDC -> screen, keep UV/w for perspective-correct interpolation.
+                        let sc_a = ndc_to_sc(&ndc_a, render_resolution);
+                        let sc_b = ndc_to_sc(&ndc_b, render_resolution);
+                        let sc_c = ndc_to_sc(&ndc_c, render_resolution);
+
+                        let sa = ScreenVert {
+                            x: sc_a.x,
+                            y: sc_a.y,
+                            z: ndc_a.z,
+                            inv_w: invwa,
+                            u_over_w: a.uv.x * invwa,
+                            v_over_w: a.uv.y * invwa,
+                        };
+                        let sb = ScreenVert {
+                            x: sc_b.x,
+                            y: sc_b.y,
+                            z: ndc_b.z,
+                            inv_w: invwb,
+                            u_over_w: b.uv.x * invwb,
+                            v_over_w: b.uv.y * invwb,
+                        };
+                        let sc = ScreenVert {
+                            x: sc_c.x,
+                            y: sc_c.y,
+                            z: ndc_c.z,
+                            inv_w: invwc,
+                            u_over_w: c.uv.x * invwc,
+                            v_over_w: c.uv.y * invwc,
+                        };
+
+                        draw_texture_tri(
+                            &mut d,
+                            &state.texture,
+                            sa,
+                            sb,
+                            sc,
+                            &mut state.z_buffer,
+                            state.render_dims.x as usize,
+                            viewport_w,
+                            viewport_h,
+                        );
                     }
-
-                    // NDC -> screen, keep UV/w for perspective-correct interpolation.
-                    let sc_a = ndc_to_sc(&ndc_a, render_resolution);
-                    let sc_b = ndc_to_sc(&ndc_b, render_resolution);
-                    let sc_c = ndc_to_sc(&ndc_c, render_resolution);
-
-                    let sa = ScreenVert {
-                        x: sc_a.x,
-                        y: sc_a.y,
-                        z: ndc_a.z,
-                        inv_w: invwa,
-                        u_over_w: a.uv.x * invwa,
-                        v_over_w: a.uv.y * invwa,
-                    };
-                    let sb = ScreenVert {
-                        x: sc_b.x,
-                        y: sc_b.y,
-                        z: ndc_b.z,
-                        inv_w: invwb,
-                        u_over_w: b.uv.x * invwb,
-                        v_over_w: b.uv.y * invwb,
-                    };
-                    let sc = ScreenVert {
-                        x: sc_c.x,
-                        y: sc_c.y,
-                        z: ndc_c.z,
-                        inv_w: invwc,
-                        u_over_w: c.uv.x * invwc,
-                        v_over_w: c.uv.y * invwc,
-                    };
-
-                    draw_texture_tri(
-                        &mut d,
-                        &state.texture,
-                        sa,
-                        sb,
-                        sc,
-                        &mut state.z_buffer,
-                        state.render_dims.x as usize,
-                        viewport_w,
-                        viewport_h,
-                    );
                 }
             }
         }
