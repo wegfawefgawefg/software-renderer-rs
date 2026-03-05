@@ -1,9 +1,10 @@
 use glam::{Mat4, Vec2, Vec3, Vec3Swizzles, Vec4};
 use image::{DynamicImage, GenericImageView};
 use raylib::prelude::*;
+use std::path::{Path, PathBuf};
 
-use crate::model::{load_cube, load_from_obj, TriIndices};
 use crate::bvh;
+use crate::model::{load_cube, load_from_obj, TriIndices};
 
 pub const FRAMES_PER_SECOND: u32 = 60;
 
@@ -17,6 +18,12 @@ const WATER_KX: f32 = 0.28;
 const WATER_KZ: f32 = 0.22;
 const WATER_SPEED: f32 = 1.0;
 const WATER_WORLD_POS: Vec3 = Vec3::new(0.0, 0.0, -12.0);
+
+fn asset_path(filename: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join(filename)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct FloatingBox {
@@ -58,8 +65,9 @@ pub struct State {
 
 impl State {
     pub fn new(render_dims: glam::UVec2) -> Self {
-        let texture = image::open("./box.png").unwrap_or_else(|e| {
-            println!("Error opening image: {}", e);
+        let texture_path = asset_path("box.png");
+        let texture = image::open(&texture_path).unwrap_or_else(|e| {
+            println!("Error opening image {}: {}", texture_path.display(), e);
             std::process::exit(1);
         });
 
@@ -98,7 +106,7 @@ impl State {
             palm: crate::model::gen_palm_tree(),
             crate_box: crate::model::gen_solid_cube([150u8, 112u8, 76u8, 255u8]),
             floating_boxes,
-            tree: load_from_obj("./treepot.obj"),
+            tree: load_from_obj(asset_path("treepot.obj")),
         }
     }
 }
@@ -225,7 +233,8 @@ fn water_height_world(x: f32, z: f32, t: f32) -> f32 {
     // Convert to water-local coords.
     let lx = x - WATER_WORLD_POS.x;
     let lz = z - WATER_WORLD_POS.z;
-    let wave = (lx * WATER_KX + t * WATER_SPEED).sin() * (lz * WATER_KZ + t * (WATER_SPEED * 0.8)).cos();
+    let wave =
+        (lx * WATER_KX + t * WATER_SPEED).sin() * (lz * WATER_KZ + t * (WATER_SPEED * 0.8)).cos();
     WATER_WORLD_POS.y + WATER_LOCAL_Y0 + WATER_AMP * wave
 }
 
@@ -342,11 +351,7 @@ pub fn ndc_to_sc(v: &Vec3, render_resolution: Vec2) -> Vec3 {
     // sy = (1 - (ndc.y*0.5 + 0.5)) * (h-1)   (y down)
     let w = (render_resolution.x - 1.0).max(1.0);
     let h = (render_resolution.y - 1.0).max(1.0);
-    Vec3::new(
-        (v.x * 0.5 + 0.5) * w,
-        (1.0 - (v.y * 0.5 + 0.5)) * h,
-        v.z,
-    )
+    Vec3::new((v.x * 0.5 + 0.5) * w, (1.0 - (v.y * 0.5 + 0.5)) * h, v.z)
 }
 
 pub fn sample_texture(texture: &DynamicImage, uv: Vec2) -> Color {
@@ -720,15 +725,7 @@ fn draw_solid_model(
             };
 
             draw_solid_tri(
-                d,
-                face_color,
-                sa,
-                sb,
-                sc,
-                z_buffer,
-                z_buffer_w,
-                viewport_w,
-                viewport_h,
+                d, face_color, sa, sb, sc, z_buffer, z_buffer_w, viewport_w, viewport_h,
             );
         }
     }
@@ -937,7 +934,13 @@ pub fn draw(state: &mut State, d: &mut RaylibTextureMode<RaylibDrawHandle>) {
 
     // Draw water (semi-transparent), after opaque objects so it alpha-blends correctly.
     {
-        let mvp = build_mvp(WATER_WORLD_POS, 0.0, Vec3::splat(1.0), &state.cam, aspect_ratio);
+        let mvp = build_mvp(
+            WATER_WORLD_POS,
+            0.0,
+            Vec3::splat(1.0),
+            &state.cam,
+            aspect_ratio,
+        );
         draw_solid_model(
             &mut d,
             water,

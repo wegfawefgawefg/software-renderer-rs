@@ -196,8 +196,7 @@ impl Bvh {
 
         let mid = (start + end) / 2;
         self.tri_ids[start..end].select_nth_unstable_by(mid - start, |&a, &b| {
-            tri_centroid(&self.tris[a])[axis]
-                .total_cmp(&tri_centroid(&self.tris[b])[axis])
+            tri_centroid(&self.tris[a])[axis].total_cmp(&tri_centroid(&self.tris[b])[axis])
         });
 
         let node_id = self.nodes.len() as i32;
@@ -251,4 +250,3 @@ impl Bvh {
         best_hit
     }
 }
-

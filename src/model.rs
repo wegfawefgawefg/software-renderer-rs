@@ -1,4 +1,5 @@
 use glam::{Vec2, Vec3};
+use std::path::Path;
 
 use crate::cube;
 
@@ -156,13 +157,7 @@ pub fn gen_water_plane(nx: usize, nz: usize, width: f32, depth: f32, y: f32) -> 
     }
 }
 
-pub fn gen_foam_ring(
-    segments: usize,
-    inner_r: f32,
-    outer_r: f32,
-    y: f32,
-    alpha: u8,
-) -> Model {
+pub fn gen_foam_ring(segments: usize, inner_r: f32, outer_r: f32, y: f32, alpha: u8) -> Model {
     // Flat trapezoidal ring (annulus strip) intended to sit slightly above water.
     let segments = segments.max(8);
     let inner_r = inner_r.max(0.01);
@@ -264,7 +259,11 @@ fn append_mesh(
 ) {
     let base = dst_verts.len();
     dst_verts.extend_from_slice(src_verts);
-    dst_tris.extend(src_tris.iter().map(|t| [t[0] + base, t[1] + base, t[2] + base]));
+    dst_tris.extend(
+        src_tris
+            .iter()
+            .map(|t| [t[0] + base, t[1] + base, t[2] + base]),
+    );
     dst_tri_colors.extend(std::iter::repeat(src_color).take(src_tris.len()));
 }
 
@@ -427,17 +426,21 @@ pub fn gen_palm_tree() -> Model {
             // Crown placement around trunk top.
             let crown_r = 0.18 + rand01(&mut seed) * 0.22;
             let crown_y = 4.9 + rand01(&mut seed) * 0.25;
-            let crown = Vec3::new(0.8, crown_y, 0.0)
-                + Vec3::new(yaw.cos(), 0.0, yaw.sin()) * crown_r;
+            let crown =
+                Vec3::new(0.8, crown_y, 0.0) + Vec3::new(yaw.cos(), 0.0, yaw.sin()) * crown_r;
 
-            let rot =
-                glam::Quat::from_rotation_y(yaw) * glam::Quat::from_rotation_x(roll);
+            let rot = glam::Quat::from_rotation_y(yaw) * glam::Quat::from_rotation_x(roll);
 
             let mut f_verts: Vertices = Vec::with_capacity(10);
             let mut f_tris: TriIndices = Vec::with_capacity(16);
 
             // Helper: add a trapezoid segment between pa->pb with widths wa->wb (half-width).
-            let mut add_seg = |pa: Vec3, pb: Vec3, wa: f32, wb: f32, f_verts: &mut Vertices, f_tris: &mut TriIndices| {
+            let mut add_seg = |pa: Vec3,
+                               pb: Vec3,
+                               wa: f32,
+                               wb: f32,
+                               f_verts: &mut Vertices,
+                               f_tris: &mut TriIndices| {
                 let base = f_verts.len();
                 f_verts.push(pa + Vec3::new(0.0, 0.0, -wa));
                 f_verts.push(pa + Vec3::new(0.0, 0.0, wa));
@@ -529,11 +532,12 @@ pub fn gen_palm_tree() -> Model {
 }
 
 // Keep the name used by `src/sketch.rs`.
-pub fn load_from_obj(path: &str) -> Model {
+pub fn load_from_obj(path: impl AsRef<Path>) -> Model {
     load_model_from_obj(path)
 }
 
-pub fn load_model_from_obj(path: &str) -> Model {
+pub fn load_model_from_obj(path: impl AsRef<Path>) -> Model {
+    let path = path.as_ref();
     let (models, _materials) =
         tobj::load_obj(path, &tobj::LoadOptions::default()).expect("Failed to OBJ load file");
     // let materials = materials.expect("Failed to load MTL file");
